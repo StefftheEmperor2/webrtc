@@ -1,0 +1,14 @@
+body .login,
+body .user_list,
+body .active_call
+{
+    display: none;
+    width: 100%;
+    height: 100%;
+}
+body.login .login,
+body.user_list .user_list,
+body.active_call .active_call
+{
+    display: block;
+}
