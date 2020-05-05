@@ -12,3 +12,25 @@ body.active_call .active_call
 {
     display: block;
 }
+
+#user_list {
+    display: block;
+    list-style-type: none;
+    padding: 0;
+}
+
+#user_list li {
+    border: 1px solid #A3A3A3;
+    cursor: pointer;
+}
+
+#user_list li.myself {
+    cursor: default;
+}
+
+#user_list li.selected {
+    background-color: #C3C3C3;
+}
+
+
+
