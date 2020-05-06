@@ -37,24 +37,38 @@ func newInvitation(conference string, guest string) *Invitation {
 }
 
 type Conference struct {
-	Users *[]User
+	Users *[]*User
 	Initiator *User
 	Uuid *uuid.UUID
 }
 
 func (conference *Conference) addUser(user *User)  {
 	users := conference.Users
-	*conference.Users = append(*users, *user)
+	*conference.Users = append(*users, user)
+}
+
+func (conference *Conference) stream() {
+	users := conference.Users
+	for _, user := range *users {
+		for _, anotherUser := range *users {
+			if user != anotherUser {
+				newTransceiver(user, anotherUser)
+			}
+		}
+	}
 }
 
 func newConference(initiator *User) *Conference {
-	users := make([]User, 0)
+	users := make([]*User, 0)
 	uuid, _ := uuid.NewUUID()
-	return &Conference{
+	conference := &Conference{
 		Users: &users,
 		Initiator: initiator,
 		Uuid: &uuid,
 	}
+
+	go conference.stream()
+	return conference
 }
 
 type ConferenceList struct {
@@ -73,18 +87,82 @@ func newConferenceList() *ConferenceList {
 	return &ConferenceList{conferences: &conferences}
 }
 
+type Transceiver struct {
+	User *User
+	AnotherUser *User
+}
+
+func copyTrack(src *webrtc.Track, dst *webrtc.Track)  {
+	rtpBuf := make([]byte, 1400)
+	for {
+		i, readErr := src.Read(rtpBuf)
+		if readErr != nil {
+			panic(readErr)
+		}
+
+		// ErrClosedPipe means we don't have any subscribers, this is ok if no peers have connected yet
+		if _, err := dst.Write(rtpBuf[:i]); err != nil && err != io.ErrClosedPipe {
+			panic(err)
+		}
+	}
+}
+func (transceiver *Transceiver) transceive() {
+	user := transceiver.User
+	anotherUser := transceiver.AnotherUser
+	var remoteVideoTrack *webrtc.Track
+	var remoteAudioTrack *webrtc.Track
+	videoStarted := false
+	audioStarted := false
+	var peerConnection *webrtc.PeerConnection
+
+	for ; ! (audioStarted && videoStarted) ; {
+		peerConnection = anotherUser.PeerConnection
+		if peerConnection != nil {
+			if ! videoStarted {
+				remoteVideoTrack = user.RemoteVideoTrack
+				if remoteVideoTrack != nil {
+					localVideoTrack, _ := peerConnection.NewTrack(remoteVideoTrack.PayloadType(), remoteVideoTrack.SSRC(), "video", "pion")
+					if localVideoTrack != nil {
+						go copyTrack(remoteVideoTrack, localVideoTrack)
+						videoStarted = true
+					}
+				}
+			}
+
+			if ! audioStarted {
+				remoteAudioTrack = user.RemoteAudioTrack
+				if remoteAudioTrack != nil {
+					localAudioTrack, _ := peerConnection.NewTrack(remoteAudioTrack.PayloadType(), remoteAudioTrack.SSRC(), "audio", "pion")
+					if localAudioTrack != nil {
+						go copyTrack(remoteAudioTrack, localAudioTrack)
+						audioStarted = true
+					}
+				}
+			}
+
+		}
+	}
+}
+func newTransceiver(user *User, anotherUser *User) *Transceiver {
+	transceiver := Transceiver{User: user, AnotherUser: anotherUser}
+	go transceiver.transceive()
+	return &transceiver
+}
 type User struct {
 	Username string
 	Invitation chan *Invitation
 	RemoteConnection *webrtc.PeerConnection
 	RemoteConnectionChannel chan *string
+	RemoteVideoTrack *webrtc.Track
+	RemoteAudioTrack *webrtc.Track
+	PeerConnection *webrtc.PeerConnection
 }
 
-func (user User) getUsername() string {
+func (user *User) getUsername() string {
 	return user.Username
 }
 
-func (user User) createRemoteConnection(offer *WebsocketOffer) string {
+func (user *User) createRemoteConnection(offer *WebsocketOffer) string {
 	fmt.Println(fmt.Sprintf("Creating remote connection for user %s", user.getUsername()))
 	recvOnlyOffer := webrtc.SessionDescription{}
 	DecodeOffer(offer.LocalDescription, &recvOnlyOffer)
@@ -106,6 +184,7 @@ func (user User) createRemoteConnection(offer *WebsocketOffer) string {
 	}
 
 	peerConnection, err := api.NewPeerConnection(peerConnectionConfig)
+	user.PeerConnection = peerConnection
 	if err != nil {
 		panic(err)
 	}
@@ -116,10 +195,18 @@ func (user User) createRemoteConnection(offer *WebsocketOffer) string {
 		panic(err)
 	}
 
-	localTrackChan := make(chan *webrtc.Track)
 	// Set a handler for when a new remote track starts, this just distributes all our packets
 	// to connected peers
 	peerConnection.OnTrack(func(remoteTrack *webrtc.Track, receiver *webrtc.RTPReceiver) {
+		fmt.Println(fmt.Sprintf("remote track of user %s started", user.getUsername()))
+		switch remoteTrack.Kind() {
+			case webrtc.RTPCodecTypeVideo:
+					user.RemoteVideoTrack = remoteTrack
+				break
+			case webrtc.RTPCodecTypeAudio:
+					user.RemoteAudioTrack = remoteTrack
+				break
+		}
 		// Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
 		// This can be less wasteful by processing incoming RTCP events, then we would emit a NACK/PLI when a viewer requests it
 		go func() {
@@ -130,26 +217,6 @@ func (user User) createRemoteConnection(offer *WebsocketOffer) string {
 				}
 			}
 		}()
-
-		// Create a local track, all our SFU clients will be fed via this track
-		localTrack, newTrackErr := peerConnection.NewTrack(remoteTrack.PayloadType(), remoteTrack.SSRC(), "video", "pion")
-		if newTrackErr != nil {
-			panic(newTrackErr)
-		}
-		localTrackChan <- localTrack
-
-		rtpBuf := make([]byte, 1400)
-		for {
-			i, readErr := remoteTrack.Read(rtpBuf)
-			if readErr != nil {
-				panic(readErr)
-			}
-
-			// ErrClosedPipe means we don't have any subscribers, this is ok if no peers have connected yet
-			if _, err = localTrack.Write(rtpBuf[:i]); err != nil && err != io.ErrClosedPipe {
-				panic(err)
-			}
-		}
 	})
 
 	// Set the remote SessionDescription
@@ -191,11 +258,11 @@ func newUser(Username string) *User {
 }
 
 type UserList struct {
-	users *[]User
+	users *[]*User
 }
 
 func newUserList() *UserList {
-	users := make([]User, 0)
+	users := make([]*User, 0)
 	return &UserList{users: &users}
 }
 
@@ -211,12 +278,8 @@ func (userList *UserList) has(user *User) bool {
 }
 
 func (userList *UserList) append(user *User)  {
-	if userList.users == nil {
-		newList := make([]User, 0)
-		userList.users = &newList
-	}
 	if ! userList.has(user)	{
-		*userList.users = append(*userList.users, *user)
+		*userList.users = append(*userList.users, user)
 	}
 }
 
@@ -234,7 +297,7 @@ func (userList *UserList) remove(user *User) {
 					if userListLength > 1 {
 						dereferencedUserList = dereferencedUserList[:len(dereferencedUserList)-2]
 					} else {
-						dereferencedUserList = make([]User, 0)
+						dereferencedUserList = make([]*User, 0)
 					}
 				}
 			}
@@ -257,7 +320,7 @@ func (userList UserList) getFirst() *User {
 		return nil
 	}
 	user := userSlice[0]
-	return &user
+	return user
 }
 
 type WebsocketMessage struct {
@@ -283,7 +346,7 @@ func (userList UserList) diffTo(anotherUserList *UserList) (*UserList, *UserList
 				}
 			}
 			if ! found {
-				added.append(&user)
+				added.append(user)
 			}
 		}
 	}
@@ -301,7 +364,7 @@ func (userList UserList) diffTo(anotherUserList *UserList) (*UserList, *UserList
 			}
 
 			if ! found {
-				removed.append(&anotherUser)
+				removed.append(anotherUser)
 			}
 		}
 	}
@@ -329,7 +392,8 @@ func newWebsocketHandler(upgrader *websocket.Upgrader, userList *UserList) *Webs
 }
 func (appInstance *AppInstance) addUser(user *User) {
 	fmt.Println(fmt.Sprintf("AppInstance %p Adding User \"%s\" to handler", &appInstance, user.Username))
-	*appInstance.userList.users = append(*appInstance.userList.users, *user)
+	users := appInstance.userList.users
+	*users = append(*appInstance.userList.users, user)
 }
 
 func (appInstance *AppInstance) getMyself() *User {
@@ -441,7 +505,7 @@ func (appInstance *AppInstance) handleCallAction(
 			for _, offerUserName := range websocketOffer.Users {
 				for _, user := range *userList.users {
 					if user.Username == offerUserName {
-						conference.addUser(&user)
+						conference.addUser(user)
 						fmt.Println(fmt.Sprintf("Inviting %s", user.getUsername()))
 						select {
 							case user.Invitation <- newInvitation(conference.Uuid.String(), ownUserName):
@@ -502,9 +566,9 @@ func (appInstance *AppInstance) run(userList *UserList) {
 		if  ! isInitialized {
 			for _, currentUser := range *userList.users {
 				initUserList := newUserList()
-				if &currentUser != appInstance.myself {
-					appInstance.userList.append(&currentUser)
-					initUserList.append(&currentUser)
+				if currentUser != appInstance.myself {
+					appInstance.userList.append(currentUser)
+					initUserList.append(currentUser)
 				}
 				writeUserMessages(appInstance.websocketConnection, initUserList, "add")
 				initUserList = nil
@@ -518,11 +582,11 @@ func (appInstance *AppInstance) run(userList *UserList) {
 		writeUserMessages(appInstance.websocketConnection, inGlobalUserlistOnly, "add")
 
 		for _, user := range *inAppUserlistOnly.users {
-			userList.append(&user)
+			userList.append(user)
 		}
 
 		for _, user := range *inGlobalUserlistOnly.users {
-			appInstance.userList.append(&user)
+			appInstance.userList.append(user)
 		}
 
 		if ! appInstance.userList.isEmpty() {
